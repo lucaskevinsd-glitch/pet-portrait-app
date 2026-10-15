@@ -90,8 +90,7 @@ const USAGE = [
   '3. 「场景提示词」可单独使用，也可用来替换主提示词里的场景部分。',
   '4. 生成后对照原照片检查：毛色、花纹、眼睛、耳朵、脸型、身体比例。发现走样就重新生成，或先把特征卡填得更具体，再重新生成提示词。',
   '注意：本网站只生成提示词，不会分析你的照片，也不会把照片上传到任何服务器。提示词里的特征全部来自你填写的特征卡；没填的特征请以参考照片为准，不要让生图工具自行编造。',
-].join(
-);
+].join('\n');
 
 export function buildPromptSet(
   styleId: StyleId,
@@ -108,8 +107,7 @@ export function buildPromptSet(
   const lines = identityLines(identity);
   const identityBlock =
     lines.length > 0
-      ? lines.join(
-)
+      ? lines.join('\n')
       : '（未填写特征卡：请严格以参考照片为准，不要自行补充或编造任何宠物特征。）';
 
   const sceneBlock =
@@ -141,8 +139,7 @@ export function buildPromptSet(
     '',
     '## 防走样约束',
     '不要改变宠物身份特征；不要添加参考照片中不存在的花纹、饰品或第二只动物；不要改变脸型和身体比例。',
-  ].join(
-);
+  ].join('\n');
 
   const negative = `${BASE_NEGATIVE}，${style.negative}`;
   const scenePrompt =

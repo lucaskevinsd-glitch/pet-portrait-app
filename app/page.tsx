@@ -2,40 +2,28 @@
 
 import { useMemo, useRef, useState } from 'react';
 import { STYLES, type StyleId } from '../lib/styles';
+import { SCENES, type SceneId } from '../lib/scenes';
 import {
-  buildPrompt,
+  buildPromptSet,
   EMPTY_IDENTITY,
-  NEGATIVE_HINT,
   type IdentityCard,
+  type PromptSet,
 } from '../lib/prompt';
-import {
-  IMAGE_SIZE_LABEL,
-  estimateBatchCost,
-  formatUSD,
-  pricePerImage,
-  type ImageSize,
-} from '../lib/pricing';
 
 interface Photo {
   id: string;
   dataUrl: string;
-  base64: string;
-  mimeType: string;
 }
 
-interface GenResult {
-  id: string;
-  styleId: StyleId;
-  stage: 'master' | 'extend';
-  status: 'generating' | 'done' | 'error';
-  data?: string;
-  mimeType?: string;
-  error?: string;
-}
+const ASPECTS = ['1:1', '3:4', '4:3', '4:5', '9:16', '16:9'];
+const SIZES = ['1K', '2K', '4K'];
+const MAX_FILE_BYTES = 10 * 1024 * 1024; // 单张本地预览上限 10MB
+const MAX_FIELD_LEN = 200;
 
-const ASPECTS = ['1:1', '3:4', '4:3', '9:16', '16:9'];
-
-/** 前端压缩：最长边 1024px，JPEG 0.85，控制请求体远小于 Vercel 4.5MB 上限 */
+/**
+ * 前端本地压缩：最长边 1024px，JPEG 0.85，减少内存占用。
+ * 照片只保存在浏览器内存里，不上传到任何服务器。
+ */
 async function compressImage(file: File): Promise<Photo> {
   const dataUrl = await new Promise<string>((res, rej) => {
     const r = new FileReader();
@@ -62,58 +50,57 @@ async function compressImage(file: File): Promise<Photo> {
   return {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     dataUrl: out,
-    base64: out.split(',')[1],
-    mimeType: 'image/jpeg',
   };
 }
 
-async function callGenerate(body: {
-  prompt: string;
-  images: { data: string; mimeType: string }[];
-  aspectRatio: string;
-  imageSize: ImageSize;
-}): Promise<{ data: string; mimeType: string }> {
-  const res = await fetch('/api/generate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const json = await res.json();
-  if (!res.ok || !json.ok) {
-    throw new Error(json.message || `请求失败（${res.status}）`);
+/** 复制：优先 Clipboard API，失败时用 textarea 兜底 */
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      return true;
+    } catch {
+      return false;
+    }
   }
-  return json.image;
 }
+
+type DraftKey = 'main' | 'negative' | 'scene';
 
 export default function Home() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [mainIndex, setMainIndex] = useState(0);
   const [identity, setIdentity] = useState<IdentityCard>(EMPTY_IDENTITY);
-  const [masterStyle, setMasterStyle] = useState<StyleId>('P01');
-  const [extendStyles, setExtendStyles] = useState<StyleId[]>([]);
+  const [styleId, setStyleId] = useState<StyleId>('P01');
+  const [sceneId, setSceneId] = useState<SceneId>('auto');
   const [aspectRatio, setAspectRatio] = useState('1:1');
-  const [imageSize, setImageSize] = useState<ImageSize>('1K');
-  const [stage, setStage] = useState<'input' | 'master' | 'extend'>('input');
-  const [master, setMaster] = useState<GenResult | null>(null);
-  const [results, setResults] = useState<GenResult[]>([]);
-  const [busy, setBusy] = useState(false);
+  const [imageSize, setImageSize] = useState('1K');
+  const [generated, setGenerated] = useState<PromptSet | null>(null);
+  /** 可编辑的提示词副本：用户改完后保留，直到下一次重新生成 */
+  const [drafts, setDrafts] = useState<Record<DraftKey, string> | null>(null);
+  /** 生成时所用参数的快照，用于提示“参数已变化，请重新生成” */
+  const [generatedFrom, setGeneratedFrom] = useState('');
+  const [copied, setCopied] = useState<string>('');
   const [error, setError] = useState('');
-  const [confirm, setConfirm] = useState<null | {
-    kind: 'master' | 'extend' | 'regen';
-    count: number;
-    inputImages: number;
-    styleId?: StyleId;
-    resultId?: string;
-  }>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const masterStyleName = useMemo(
-    () => STYLES.find((s) => s.id === masterStyle)?.name ?? masterStyle,
-    [masterStyle],
+  const styleName = useMemo(
+    () => STYLES.find((s) => s.id === styleId)?.name ?? styleId,
+    [styleId],
   );
 
   const setId = (k: keyof IdentityCard, v: string) =>
-    setIdentity((p) => ({ ...p, [k]: v }));
+    setIdentity((p) => ({ ...p, [k]: v.slice(0, MAX_FIELD_LEN) }));
 
   const onFiles = async (files: FileList | null) => {
     if (!files) return;
@@ -129,6 +116,10 @@ export default function Home() {
         setError(`跳过 ${f.name}：请用 JPG / PNG / WebP。`);
         continue;
       }
+      if (f.size > MAX_FILE_BYTES) {
+        setError(`跳过 ${f.name}：单张照片超过 10MB。`);
+        continue;
+      }
       try {
         done.push(await compressImage(f));
       } catch {
@@ -138,215 +129,114 @@ export default function Home() {
     if (done.length) setPhotos((p) => [...p, ...done].slice(0, 5));
   };
 
-  /** 主参考图排第一位，其余按上传顺序 */
-  const orderedPhotos = useMemo(() => {
-    if (!photos.length) return [];
-    const copy = [...photos];
-    const [m] = copy.splice(Math.min(mainIndex, copy.length - 1), 1);
-    return [m, ...copy];
-  }, [photos, mainIndex]);
+  const clearAllPhotos = () => {
+    setPhotos([]);
+    setMainIndex(0);
+    if (fileRef.current) fileRef.current.value = '';
+  };
 
-  const runMaster = async () => {
-    if (!photos.length) return;
-    setBusy(true);
-    setError('');
-    const prompt = buildPrompt(masterStyle, identity, 'master');
-    const id = `master-${Date.now()}`;
-    setMaster({
-      id,
-      styleId: masterStyle,
-      stage: 'master',
-      status: 'generating',
+  const inputsSnapshot = JSON.stringify({
+    identity,
+    styleId,
+    sceneId,
+    aspectRatio,
+    imageSize,
+  });
+  const dirty = generated !== null && generatedFrom !== inputsSnapshot;
+
+  const generate = () => {
+    const set = buildPromptSet(styleId, identity, {
+      aspectRatio,
+      imageSize,
+      sceneId,
     });
-    try {
-      const img = await callGenerate({
-        prompt,
-        images: orderedPhotos.map((p) => ({
-          data: p.base64,
-          mimeType: p.mimeType,
-        })),
-        aspectRatio,
-        imageSize,
-      });
-      setMaster({
-        id,
-        styleId: masterStyle,
-        stage: 'master',
-        status: 'done',
-        data: img.data,
-        mimeType: img.mimeType,
-      });
-      setStage('master');
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : '生成失败';
-      setMaster({
-        id,
-        styleId: masterStyle,
-        stage: 'master',
-        status: 'error',
-        error: msg,
-      });
-      setError(msg);
-    } finally {
-      setBusy(false);
-      setConfirm(null);
-    }
-  };
-
-  const runExtend = async () => {
-    if (!master?.data || extendStyles.length === 0) return;
-    setBusy(true);
+    setGenerated(set);
+    setDrafts({ main: set.main, negative: set.negative, scene: set.scene });
+    setGeneratedFrom(inputsSnapshot);
     setError('');
-    const base: GenResult[] = extendStyles.map((sid) => ({
-      id: `ext-${sid}-${Date.now()}`,
-      styleId: sid,
-      stage: 'extend',
-      status: 'generating' as const,
-    }));
-    setResults((p) => [...p, ...base]);
-    // 逐张顺序调用：避免并发冲额度，也便于单张失败单独重试
-    for (const item of base) {
-      const prompt = buildPrompt(item.styleId, identity, 'extend');
-      try {
-        const img = await callGenerate({
-          prompt,
-          images: [
-            {
-              data: orderedPhotos[0].base64,
-              mimeType: orderedPhotos[0].mimeType,
-            },
-            { data: master.data!, mimeType: master.mimeType || 'image/png' },
-          ],
-          aspectRatio,
-          imageSize,
-        });
-        setResults((p) =>
-          p.map((r) =>
-            r.id === item.id
-              ? { ...r, status: 'done', data: img.data, mimeType: img.mimeType }
-              : r,
-          ),
-        );
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : '生成失败';
-        setResults((p) =>
-          p.map((r) =>
-            r.id === item.id ? { ...r, status: 'error', error: msg } : r,
-          ),
-        );
-      }
-    }
-    setBusy(false);
-    setConfirm(null);
-    setStage('extend');
   };
 
-  const regenOne = async (resultId: string, styleId: StyleId) => {
-    if (!master?.data) return;
-    setBusy(true);
-    setError('');
-    setResults((p) =>
-      p.map((r) =>
-        r.id === resultId ? { ...r, status: 'generating', error: undefined } : r,
-      ),
-    );
-    try {
-      const img = await callGenerate({
-        prompt: buildPrompt(styleId, identity, 'extend'),
-        images: [
-          {
-            data: orderedPhotos[0].base64,
-            mimeType: orderedPhotos[0].mimeType,
-          },
-          { data: master.data!, mimeType: master.mimeType || 'image/png' },
-        ],
-        aspectRatio,
-        imageSize,
-      });
-      setResults((p) =>
-        p.map((r) =>
-          r.id === resultId
-            ? { ...r, status: 'done', data: img.data, mimeType: img.mimeType }
-            : r,
-        ),
-      );
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : '生成失败';
-      setResults((p) =>
-        p.map((r) =>
-          r.id === resultId ? { ...r, status: 'error', error: msg } : r,
-        ),
-      );
-    } finally {
-      setBusy(false);
-      setConfirm(null);
-    }
+  const onCopy = async (key: string, text: string) => {
+    const ok = await copyText(text);
+    setCopied(ok ? `${key}已复制` : '复制失败，请手动长按选择复制');
+    setTimeout(() => setCopied(''), 2000);
   };
 
-  const downloadOne = (name: string, data: string, mime: string) => {
-    const a = document.createElement('a');
-    a.href = `data:${mime};base64,${data}`;
-    a.download = name;
-    a.click();
+  const copyAll = () => {
+    if (!drafts || !generated) return;
+    const all = [
+      '## 主提示词',
+      drafts.main,
+      '',
+      '## 负面提示词',
+      drafts.negative,
+      '',
+      '## 场景提示词',
+      drafts.scene,
+      '',
+      '## 使用说明',
+      generated.usage,
+    ].join('\n');
+    onCopy('全部', all);
   };
 
-  const downloadAll = () => {
-    const done = [master, ...results].filter(
-      (r): r is GenResult => !!r && r.status === 'done' && !!r.data,
-    );
-    done.forEach((r, i) => {
-      setTimeout(
-        () =>
-          downloadOne(
-            `${identity.petName || 'pet'}-${r.styleId}.png`,
-            r.data!,
-            r.mimeType || 'image/png',
-          ),
-        i * 300,
-      );
-    });
-  };
-
-  const exportTxt = () => {
+  const downloadTxt = () => {
+    if (!drafts || !generated) return;
+    const filled = (
+      Object.entries(identity) as [keyof IdentityCard, string][]
+    )
+      .filter(([, v]) => v.trim())
+      .map(([k, v]) => `- ${k}：${v.trim()}`)
+      .join('\n');
     const lines = [
-      `AI 宠物写真订单制作包`,
+      'AI 宠物写真提示词制作包',
       `宠物：${identity.petName || '（未填）'} / 品种：${identity.breed || '（未填）'}`,
-      `主写真风格：${masterStyleName}`,
-      `扩展风格：${extendStyles
-        .map((s) => STYLES.find((x) => x.id === s)?.name)
-        .join('、') || '（无）'}`,
+      `风格：${styleName}（${styleId}）`,
       `比例：${aspectRatio} / 清晰度：${imageSize}`,
-      ``,
-      `--- 主写真提示词 ---`,
-      buildPrompt(masterStyle, identity, 'master'),
-      ``,
-      `--- 负面约束 ---`,
-      NEGATIVE_HINT,
-      ``,
-      `--- 质检清单 ---`,
-      '□ 花纹位置与原图一致  □ 眼睛颜色一致  □ 耳朵形状一致  □ 无多余文字/水印',
+      `参考照片：${photos.length} 张（本文件不含照片，照片只在浏览器本地预览）`,
+      '',
+      '--- 已确认的宠物特征（仅含你填写的项，未填项不编造）---',
+      filled || '（未填写特征卡，使用时请以参考照片为准）',
+      '',
+      '--- 主提示词 ---',
+      drafts.main,
+      '',
+      '--- 负面提示词 ---',
+      drafts.negative,
+      '',
+      '--- 场景提示词 ---',
+      drafts.scene,
+      '',
+      '--- 使用说明 ---',
+      generated.usage,
     ];
     const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `pet-portrait-${Date.now()}.txt`;
+    a.download = `pet-portrait-prompt-${Date.now()}.txt`;
     a.click();
     URL.revokeObjectURL(a.href);
   };
 
-  const masterCost = estimateBatchCost(1, imageSize, photos.length);
-  const extendCost = estimateBatchCost(
-    Math.max(extendStyles.length, 1),
-    imageSize,
-    2,
-  );
+  const fields: { key: keyof IdentityCard; label: string; hint: string }[] = [
+    { key: 'petName', label: '宠物名字', hint: '如：团团' },
+    { key: 'breed', label: '品种', hint: '如：英短蓝猫' },
+    { key: 'coat', label: '毛色', hint: '如：蓝灰色' },
+    { key: 'markings', label: '花纹分布', hint: '如：胸口一撮白毛' },
+    { key: 'eyes', label: '眼睛', hint: '如：金色圆眼' },
+    { key: 'ears', label: '耳朵', hint: '如：立耳' },
+    { key: 'nose', label: '鼻子', hint: '如：粉色小鼻子' },
+    { key: 'faceShape', label: '脸型', hint: '如：圆脸、尖脸' },
+    { key: 'bodyType', label: '体型', hint: '如：偏胖、短腿' },
+    { key: 'specialMarks', label: '特殊标记', hint: '如：左前爪白手套、异瞳' },
+  ];
 
   return (
     <main>
-      <h1>🐾 AI 宠物写真 · 真实出图</h1>
+      <h1>🐾 AI 宠物写真提示词生成器</h1>
       <p className="sub">
-        上传宠物照片 → 选风格 → Gemini（Nano Banana 2.1）真实生成。单次调用只出 1
-        张图，每张按 {formatUSD(pricePerImage(imageSize))}（{imageSize}）估算。
+        上传宠物照片 → 填写特征 → 选风格 → 本地生成可直接复制到 Gemini
+        等生图工具使用的高质量提示词。本网站不调用任何生图 API，不产生费用；照片只在浏览器本地预览，不会上传。
       </p>
 
       <div className="card">
@@ -359,8 +249,7 @@ export default function Home() {
           onChange={(e) => onFiles(e.target.files)}
         />
         <p className="hint">
-          点一张照片设为主参考图（建议最清晰的正脸照）。上传前会自动压缩到
-          1024px 内，照片只用于本次生成，不保存到服务器。
+          点一张照片设为主参考图（建议最清晰的正脸照）。照片仅用于你自己对照填写特征和本地预览，不会被上传，也不会被网站分析。
         </p>
         <div className="thumbs">
           {photos.map((p, i) => (
@@ -384,111 +273,48 @@ export default function Home() {
             </div>
           ))}
         </div>
+        {photos.length > 0 && (
+          <div className="row" style={{ marginTop: 10 }}>
+            <button className="btn sec small" onClick={clearAllPhotos}>
+              清除全部照片
+            </button>
+          </div>
+        )}
       </div>
 
       <div className="card">
-        <h2>第 2 步 · 宠物特征卡</h2>
+        <h2>第 2 步 · 宠物特征卡（手动确认）</h2>
         <p className="hint">
-          填得越准，生成结果越像。特征会拼进每一次生成提示词。
+          请对照照片填写。本网站不会分析照片，也不会猜测特征；没填的项不会编造，提示词会要求生图工具以照片为准。已填的特征会在提示词里锁定为最高优先级。
         </p>
-        <div className="row">
-          <div>
-            <label>宠物名字</label>
+        {fields.map((f) => (
+          <div key={f.key}>
+            <label>
+              {f.label}
+              {identity[f.key].trim() && (
+                <span className="lock"> 🔒 已锁定</span>
+              )}
+            </label>
             <input
               type="text"
-              value={identity.petName}
-              onChange={(e) => setId('petName', e.target.value)}
-              placeholder="如：团团"
+              value={identity[f.key]}
+              maxLength={MAX_FIELD_LEN}
+              onChange={(e) => setId(f.key, e.target.value)}
+              placeholder={f.hint}
             />
           </div>
-          <div>
-            <label>品种</label>
-            <input
-              type="text"
-              value={identity.breed}
-              onChange={(e) => setId('breed', e.target.value)}
-              placeholder="如：英短蓝猫"
-            />
-          </div>
-        </div>
-        <div className="row">
-          <div>
-            <label>毛色</label>
-            <input
-              type="text"
-              value={identity.coat}
-              onChange={(e) => setId('coat', e.target.value)}
-              placeholder="如：蓝灰色"
-            />
-          </div>
-          <div>
-            <label>花纹分布</label>
-            <input
-              type="text"
-              value={identity.markings}
-              onChange={(e) => setId('markings', e.target.value)}
-              placeholder="如：胸口一撮白毛"
-            />
-          </div>
-        </div>
-        <div className="row">
-          <div>
-            <label>眼睛</label>
-            <input
-              type="text"
-              value={identity.eyes}
-              onChange={(e) => setId('eyes', e.target.value)}
-              placeholder="如：金色圆眼"
-            />
-          </div>
-          <div>
-            <label>耳朵</label>
-            <input
-              type="text"
-              value={identity.ears}
-              onChange={(e) => setId('ears', e.target.value)}
-              placeholder="如：立耳"
-            />
-          </div>
-        </div>
-        <div className="row">
-          <div>
-            <label>鼻子</label>
-            <input
-              type="text"
-              value={identity.nose}
-              onChange={(e) => setId('nose', e.target.value)}
-              placeholder="如：粉色小鼻子"
-            />
-          </div>
-          <div>
-            <label>体型</label>
-            <input
-              type="text"
-              value={identity.bodyType}
-              onChange={(e) => setId('bodyType', e.target.value)}
-              placeholder="如：偏胖、短腿"
-            />
-          </div>
-        </div>
-        <label>特殊标记</label>
-        <input
-          type="text"
-          value={identity.specialMarks}
-          onChange={(e) => setId('specialMarks', e.target.value)}
-          placeholder="如：左前爪白手套、异瞳"
-        />
+        ))}
       </div>
 
       <div className="card">
-        <h2>第 3 步 · 风格与出图设置</h2>
-        <label>主写真风格（第一阶段只生成这 1 种）</label>
+        <h2>第 3 步 · 风格与出图参数</h2>
+        <label>写真风格</label>
         <div className="styles">
           {STYLES.map((s) => (
             <div
               key={s.id}
-              className={`style ${masterStyle === s.id ? 'sel' : ''}`}
-              onClick={() => setMasterStyle(s.id)}
+              className={`style ${styleId === s.id ? 'sel' : ''}`}
+              onClick={() => setStyleId(s.id)}
             >
               <div className="n">{s.name}</div>
               <div className="t">{s.tagline}</div>
@@ -496,6 +322,17 @@ export default function Home() {
             </div>
           ))}
         </div>
+        <label>场景</label>
+        <select
+          value={sceneId}
+          onChange={(e) => setSceneId(e.target.value as SceneId)}
+        >
+          {SCENES.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+        </select>
         <div className="row">
           <div>
             <label>图片比例</label>
@@ -514,314 +351,106 @@ export default function Home() {
             <label>清晰度</label>
             <select
               value={imageSize}
-              onChange={(e) => setImageSize(e.target.value as ImageSize)}
+              onChange={(e) => setImageSize(e.target.value)}
             >
-              {(['1K', '2K', '4K'] as ImageSize[]).map((s) => (
+              {SIZES.map((s) => (
                 <option key={s} value={s}>
-                  {IMAGE_SIZE_LABEL[s]}
+                  {s}
                 </option>
               ))}
             </select>
           </div>
         </div>
         <p className="hint">
-          提示：先用 1K 出主写真确认像不像，确认后再用 2K 生成扩展图，省费用。
+          比例和清晰度会写进主提示词的输出要求里。切换风格、场景或参数后，点下方按钮重新生成即可更新提示词。
         </p>
-        <div className="row" style={{ marginTop: 12 }}>
-          <button className="btn sec" onClick={exportTxt}>
-            导出 TXT 制作包（提示词包）
-          </button>
-        </div>
       </div>
 
-      {stage === 'input' && (
-        <div className="card">
-          <h2>第一阶段 · 生成主写真</h2>
-          <button
-            className="btn"
-            disabled={busy || photos.length === 0}
-            onClick={() =>
-              setConfirm({
-                kind: 'master',
-                count: 1,
-                inputImages: photos.length,
-              })
-            }
-          >
-            {busy ? '生成中…' : '生成主写真'}
-          </button>
-          {confirm?.kind === 'master' && (
-            <div className="confirm">
-              <div>
-                本次将调用 Gemini 1 次，生成 1 张「{masterStyleName}」主写真。
-              </div>
-              <div>
-                预估费用约 <b>{formatUSD(masterCost)}</b>
-                （含 {photos.length} 张参考图输入）。确认后开始计费生成。
-              </div>
-              <div className="row" style={{ marginTop: 10 }}>
-                <button className="btn" onClick={runMaster} disabled={busy}>
-                  确认并生成
-                </button>
-                <button
-                  className="btn sec"
-                  onClick={() => setConfirm(null)}
-                  disabled={busy}
-                >
-                  取消
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {master && (
-        <div className="card">
-          <h2>主写真 · {masterStyleName}</h2>
-          {master.status === 'generating' && <p>生成中，请稍候…</p>}
-          {master.status === 'done' && master.data && (
-            <>
-              <img
-                className="master"
-                src={`data:${master.mimeType};base64,${master.data}`}
-                alt="主写真"
-              />
-              <div
-                className="row"
-                style={{ marginTop: 10, flexWrap: 'wrap' }}
-              >
-                <button
-                  className="btn small sec"
-                  onClick={() =>
-                    downloadOne(
-                      `${identity.petName || 'pet'}-${master.styleId}.png`,
-                      master.data!,
-                      master.mimeType || 'image/png',
+      <div className="card">
+        <h2>第 4 步 · 生成并预览提示词</h2>
+        <button className="btn" onClick={generate}>
+          {generated ? '重新生成提示词' : '生成提示词'}
+        </button>
+        {photos.length === 0 && (
+          <p className="hint">
+            未上传照片：提示词仍可生成，但使用时请务必上传参考照片，生图工具需要照片才能保持宠物长相一致。
+          </p>
+        )}
+        {dirty && (
+          <p className="warn">
+            特征、风格、场景或参数已变化，当前预览是旧版本，请点「重新生成提示词」更新。
+          </p>
+        )}
+        {generated && drafts && (
+          <>
+            {(
+              [
+                { key: 'main' as DraftKey, title: '主提示词' },
+                { key: 'negative' as DraftKey, title: '负面提示词' },
+                { key: 'scene' as DraftKey, title: '场景提示词' },
+              ]
+            ).map((b) => (
+              <div key={b.key} className="prompt-block">
+                <div className="prompt-head">
+                  <b>{b.title}</b>
+                  <button
+                    className="btn small sec"
+                    onClick={() => onCopy(b.title, drafts[b.key])}
+                  >
+                    一键复制
+                  </button>
+                </div>
+                <textarea
+                  className="prompt-text"
+                  value={drafts[b.key]}
+                  rows={b.key === 'main' ? 14 : 4}
+                  onChange={(e) =>
+                    setDrafts((d) =>
+                      d ? { ...d, [b.key]: e.target.value } : d,
                     )
                   }
-                >
-                  下载主写真
-                </button>
-                <button
-                  className="btn small sec"
-                  onClick={() =>
-                    setConfirm({
-                      kind: 'master',
-                      count: 1,
-                      inputImages: photos.length,
-                    })
-                  }
-                  disabled={busy}
-                >
-                  不满意，重新生成
-                </button>
-                <button
-                  className="btn small"
-                  onClick={() => setStage('extend')}
-                >
-                  满意，扩展其他风格 →
-                </button>
-              </div>
-            </>
-          )}
-          {master.status === 'error' && (
-            <p className="err">{master.error}</p>
-          )}
-        </div>
-      )}
-
-      {stage !== 'input' && master?.status === 'done' && (
-        <div className="card">
-          <h2>第二阶段 · 扩展其他风格</h2>
-          <p className="hint">
-            扩展时会把主写真图 + 主参考图一起传给模型，保持同一只宠物。每次调用出
-            1 张图，按勾选风格数逐张生成。
-          </p>
-          <div className="styles">
-            {STYLES.filter((s) => s.id !== masterStyle).map((s) => (
-              <div
-                key={s.id}
-                className={`style ${
-                  extendStyles.includes(s.id) ? 'sel' : ''
-                }`}
-                onClick={() =>
-                  setExtendStyles((p) =>
-                    p.includes(s.id)
-                      ? p.filter((x) => x !== s.id)
-                      : [...p, s.id].slice(0, 4),
-                  )
-                }
-              >
-                <div className="n">{s.name}</div>
-                <div className="t">{s.tagline}</div>
-                <div className="id">{s.id}</div>
+                />
+                <p className="hint">
+                  可直接编辑，修改会保留；点「重新生成提示词」会用模板重新生成并覆盖编辑。
+                </p>
               </div>
             ))}
-          </div>
-          <p className="hint">最多同时选 4 种风格。</p>
-          <button
-            className="btn"
-            disabled={busy || extendStyles.length === 0}
-            onClick={() =>
-              setConfirm({
-                kind: 'extend',
-                count: extendStyles.length,
-                inputImages: 2,
-              })
-            }
-          >
-            {busy ? '生成中…' : `生成扩展写真（${extendStyles.length} 张）`}
-          </button>
-          {confirm?.kind === 'extend' && (
-            <div className="confirm">
-              <div>
-                本次将调用 Gemini {extendStyles.length} 次，生成{' '}
-                {extendStyles.length} 张扩展写真。
+            <div className="prompt-block">
+              <div className="prompt-head">
+                <b>使用说明</b>
               </div>
-              <div>
-                预估费用约 <b>{formatUSD(extendCost)}</b>。确认后开始逐张计费生成。
-              </div>
-              <div className="row" style={{ marginTop: 10 }}>
-                <button className="btn" onClick={runExtend} disabled={busy}>
-                  确认并生成
-                </button>
-                <button
-                  className="btn sec"
-                  onClick={() => setConfirm(null)}
-                  disabled={busy}
-                >
-                  取消
-                </button>
-              </div>
+              <p className="usage">{generated.usage}</p>
             </div>
-          )}
-        </div>
-      )}
-
-      {results.length > 0 && (
-        <div className="card">
-          <h2>生成结果</h2>
-          <div className="gallery">
-            {results.map((r) => (
-              <div key={r.id} className="gen">
-                {r.status === 'done' && r.data ? (
-                  <img
-                    src={`data:${r.mimeType};base64,${r.data}`}
-                    alt={r.styleId}
-                  />
-                ) : (
-                  <div className="meta">
-                    {r.status === 'generating'
-                      ? '生成中…'
-                      : `失败：${r.error}`}
-                  </div>
-                )}
-                <div className="meta">
-                  <div className="st">
-                    {STYLES.find((s) => s.id === r.styleId)?.name} · {r.styleId}
-                  </div>
-                  {r.status === 'done' && r.data && (
-                    <div className="row" style={{ marginTop: 6 }}>
-                      <button
-                        className="btn small sec"
-                        onClick={() =>
-                          downloadOne(
-                            `${identity.petName || 'pet'}-${r.styleId}.png`,
-                            r.data!,
-                            r.mimeType || 'image/png',
-                          )
-                        }
-                      >
-                        下载
-                      </button>
-                      <button
-                        className="btn small sec"
-                        disabled={busy}
-                        onClick={() =>
-                          setConfirm({
-                            kind: 'regen',
-                            count: 1,
-                            inputImages: 2,
-                            styleId: r.styleId,
-                            resultId: r.id,
-                          })
-                        }
-                      >
-                        重生成
-                      </button>
-                    </div>
-                  )}
-                  {r.status === 'error' && (
-                    <button
-                      className="btn small sec"
-                      disabled={busy}
-                      onClick={() =>
-                        setConfirm({
-                          kind: 'regen',
-                          count: 1,
-                          inputImages: 2,
-                          styleId: r.styleId,
-                          resultId: r.id,
-                        })
-                      }
-                    >
-                      重试
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-          {confirm?.kind === 'regen' && confirm.resultId && (
-            <div className="confirm">
-              <div>重新生成 1 张，预估费用约 {formatUSD(estimateBatchCost(1, imageSize, 2))}。</div>
-              <div className="row" style={{ marginTop: 10 }}>
-                <button
-                  className="btn"
-                  disabled={busy}
-                  onClick={() =>
-                    regenOne(confirm.resultId!, confirm.styleId!)
-                  }
-                >
-                  确认并重新生成
-                </button>
-                <button
-                  className="btn sec"
-                  onClick={() => setConfirm(null)}
-                  disabled={busy}
-                >
-                  取消
-                </button>
-              </div>
+            {copied && <div className="copied">{copied}</div>}
+            <div className="row" style={{ marginTop: 12 }}>
+              <button className="btn sec" onClick={copyAll}>
+                复制全部提示词
+              </button>
             </div>
-          )}
-          <div className="row" style={{ marginTop: 12 }}>
-            <button className="btn sec" onClick={downloadAll}>
-              全部下载
-            </button>
-          </div>
-        </div>
-      )}
+            <div className="row" style={{ marginTop: 8 }}>
+              <button className="btn sec" onClick={downloadTxt}>
+                下载完整 TXT 文件
+              </button>
+            </div>
+          </>
+        )}
+      </div>
 
       {error && <div className="err">{error}</div>}
 
       <div className="card">
         <h2>说明</h2>
         <details>
-          <summary>费用与限制</summary>
+          <summary>零 API 与隐私</summary>
           <p className="muted">
-            模型：gemini-nano-banana-2.1。Interactions API 单次调用只生成 1
-            张图。图像输出无免费 tier；1K 约 $0.0336/张，2K 约
-            $0.0504/张，4K 约 $0.113/张，另有少量输入 token
-            费用。AI 不能保证 100%
-            还原宠物外貌，差异明显时请重新生成。所有生成图片带 SynthID 水印。
+            本网站不调用 Gemini API 或任何其他模型 API，不产生费用，也不需要
+            API Key。照片只在浏览器内存里做本地预览，不会上传到服务器，不会被记录；关闭页面或点「清除全部照片」后，本地预览即被清理。
           </p>
         </details>
         <details>
-          <summary>隐私</summary>
+          <summary>特征锁定</summary>
           <p className="muted">
-            照片仅用于本次生成请求，浏览器不保存，服务器不落盘。客户照片不要用于其他订单或公开宣传。
+            你填写的特征会出现在主提示词最前面的「身份锁定」区块，并声明为最高优先级；没填的特征不会被编造，提示词会要求生图工具以参考照片为准。
           </p>
         </details>
       </div>
